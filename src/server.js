@@ -2,7 +2,7 @@ import express from "express";
 import {WebSocketServer, WebSocket} from "ws";
 import http from "http";
 import dotenv from "dotenv";
-import {updateMeetingState, judgeConfidence} from "./meetingState.js";
+import {updateMeetingState, judgeConfidence} from "./lib/meetingState.js";
 
 dotenv.config();
 
