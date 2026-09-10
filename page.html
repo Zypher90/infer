@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <title>Infer Prototype</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            background: #0f1115;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px;
+        }
+
+        #status {
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #9aa;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+
+        #startBtn {
+            background: #4ade80;
+        }
+
+        #stopBtn {
+            background: #f87171;
+        }
+
+        .panels {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            max-width: 900px;
+        }
+
+        #transcript,
+        #actionItems {
+            flex: 1;
+            font-size: 15px;
+            line-height: 1.6;
+            min-height: 250px;
+            background: #1a1d24;
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        .final {
+            color: #eee;
+        }
+
+        .interim {
+            color: #6b7280;
+            font-style: italic;
+        }
+
+        .item {
+            background: #23272f;
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .item .owner {
+            color: #4ade80;
+            font-weight: 600;
+        }
+
+        .item .deadline {
+            color: #fbbf24;
+        }
+
+        .badge {
+            display: inline-block;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            margin-top: 6px;
+        }
+
+        .badge.created {
+            background: #14532d;
+            color: #4ade80;
+        }
+
+        .badge.review {
+            background: #451a03;
+            color: #fbbf24;
+        }
+
+        .item a {
+            color: #60a5fa;
+        }
+
+        h3 {
+            margin-top: 0;
+            font-size: 14px;
+            color: #9aa;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Prototype 5b</h2>
+    <div id="status">Not connected</div>
+    <div>
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+    </div>
+    <div class="panels">
+        <div id="transcript">
+            <h3>Live Transcript</h3>
+            <span id="finalText" class="final"></span><span id="interimText" class="interim"></span>
+        </div>
+        <div id="actionItems">
+            <h3>Action Items</h3>
+            <div id="itemsList"><em style="color:#666">None yet...</em></div>
+        </div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusEl = document.getElementById('status');
+        const finalTextEl = document.getElementById('finalText');
+        const interimTextEl = document.getElementById('interimText');
+        const itemsListEl = document.getElementById('itemsList');
+
+        let mediaStream, mediaRecorder, socket;
+        let currentItems = [];
+        let itemStatus = {}; // itemId -> { status: 'created'|'review', ticket?, reason? }
+
+        function render() {
+            if (!currentItems.length) {
+                itemsListEl.innerHTML = '<em style="color:#666">None yet...</em>';
+                return;
+            }
+            itemsListEl.innerHTML = currentItems.map(item => {
+                const st = itemStatus[item.id];
+                let badge = '';
+                if (st?.status === 'created') {
+                    badge = `<div class="badge created">✓ Ticket ${st.ticket.identifier}</div> <a href="${st.ticket.url}" target="_blank">view</a>`;
+                } else if (st?.status === 'review') {
+                    badge = `<div class="badge review">Needs review — ${st.reason}</div>`;
+                }
+                return `
+      <div class="item">
+        ${item.text}<br>
+        <span class="owner">${item.owner}</span> · <span class="deadline">${item.deadline}</span>
+        ${badge}
+      </div>
+    `;
+            }).join('');
+        }
+
+        async function start() {
+            socket = new WebSocket('ws://localhost:3000');
+
+            socket.onopen = () => statusEl.textContent = 'Connected — listening...';
+
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'transcript') {
+                    if (data.isFinal) {
+                        finalTextEl.textContent += data.text + ' ';
+                        interimTextEl.textContent = '';
+                    } else {
+                        interimTextEl.textContent = data.text;
+                    }
+                }
+
+                if (data.type === 'stateUpdate') {
+                    currentItems = data.state.actionItems;
+                    render();
+                }
+
+                if (data.type === 'ticketCreated') {
+                    itemStatus[data.itemId] = { status: 'created', ticket: data.ticket };
+                    render();
+                }
+
+                if (data.type === 'needsReview') {
+                    itemStatus[data.itemId] = { status: 'review', reason: data.reason };
+                    render();
+                }
+            };
+
+            socket.onclose = () => statusEl.textContent = 'Disconnected';
+            socket.onerror = (err) => console.error(err);
+
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+            });
+
+            mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm;codecs=opus' });
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+                    socket.send(event.data);
+                }
+            };
+
+            mediaRecorder.start(250);
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+        }
+
+        function stop() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (socket) socket.close();
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
+        startBtn.addEventListener('click', start);
+        stopBtn.addEventListener('click', stop);
+    </script>
+</body>
+
+</html>
