@@ -1,16 +1,12 @@
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import { updateMeetingState, judgeConfidence } from '../src/lib/meetingState.js';
+import { withRetry, sleep } from '../src/lib/apiUtils.js';
 
 dotenv.config();
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// ---- Test cases ----
-// Each case: a sequence of transcript chunks fed in order (simulating a
-// meeting), plus ground truth - the action items a human would agree
-// are genuinely there, and whether each SHOULD have been confident
-// enough to auto-ticket vs flagged for review.
 const testCases = [
   {
     name: 'Clear single item',
@@ -29,7 +25,6 @@ const testCases = [
     groundTruth: [
       { gist: 'Handle the deploy', owner: 'John', deadline: 'Monday', shouldAutoTicket: true },
       { gist: 'Update client-facing docs', owner: 'unspecified', deadline: 'before launch', shouldAutoTicket: false }
-      // no clear owner -> should NOT auto-ticket
     ]
   },
   {
@@ -42,94 +37,137 @@ const testCases = [
   {
     name: 'No action items - pure discussion',
     chunks: ["I think the roadmap looks solid overall. Good alignment across the team."],
-    groundTruth: [] // nothing should be extracted - tests against hallucination
+    groundTruth: []
   }
 ];
 
-// ---- LLM-based fuzzy matcher ----
-// Extracted item text won't match ground truth word-for-word (LLMs
-// paraphrase). Instead of brittle string matching, we ask the model
-// directly: "do these represent the same real commitment?"
-const matchSchema = {
+// ---- Batched matcher: one call matches ALL extracted items against ALL
+// ground truth items for a test case, instead of one call per pair.
+// This is the key change that cuts our call count dramatically.
+const batchMatchSchema = {
   type: Type.OBJECT,
   properties: {
-    isMatch: { type: Type.BOOLEAN }
+    matches: {
+      type: Type.ARRAY,
+      description: 'One entry per ground truth item that has a matching extracted item.',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          groundTruthIndex: { type: Type.NUMBER, description: 'Index into the ground truth list (0-based).' },
+          extractedItemId: { type: Type.STRING, description: 'The id of the matching extracted item.' }
+        },
+        required: ['groundTruthIndex', 'extractedItemId']
+      }
+    }
   },
-  required: ['isMatch']
+  required: ['matches']
 };
 
-async function isSameCommitment(extractedItem, groundTruthItem) {
-  const prompt = `
-Extracted item: text="${extractedItem.text}", owner="${extractedItem.owner}", deadline="${extractedItem.deadline}"
-Ground truth item: gist="${groundTruthItem.gist}", owner="${groundTruthItem.owner}", deadline="${groundTruthItem.deadline}"
+async function matchAllItems(extracted, groundTruth) {
+  if (extracted.length === 0 || groundTruth.length === 0) return [];
 
-Do these represent the SAME real-world commitment (same task, same owner, same deadline meaning)?
-`;
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.6-flash',
-    contents: prompt,
-    config: { responseMimeType: 'application/json', responseSchema: matchSchema }
+  return withRetry(async () => {
+    const prompt = `
+        Extracted items:
+        ${extracted.map((item, i) => `[${item.id}] text="${item.text}", owner="${item.owner}", deadline="${item.deadline}"`).join('\n')}
+
+        Ground truth items:
+        ${groundTruth.map((gt, i) => `[${i}] gist="${gt.gist}", owner="${gt.owner}", deadline="${gt.deadline}"`).join('\n')}
+
+        For each ground truth item, find the extracted item (if any) that represents the SAME real-world commitment (same task, same owner, same deadline meaning). Only include actual matches.
+        `;
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.6-flash',
+      contents: prompt,
+      config: { responseMimeType: 'application/json', responseSchema: batchMatchSchema }
+    });
+    return JSON.parse(response.text).matches;
   });
-  return JSON.parse(response.text).isMatch;
 }
 
-// ---- Run one test case through the real pipeline ----
+// ---- Batched confidence judging: one call judges ALL matched items ----
+const batchConfidenceSchema = {
+  type: Type.OBJECT,
+  properties: {
+    judgments: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          itemId: { type: Type.STRING },
+          isConfident: { type: Type.BOOLEAN }
+        },
+        required: ['itemId', 'isConfident']
+      }
+    }
+  },
+  required: ['judgments']
+};
+
+async function judgeAllConfidence(items) {
+  if (items.length === 0) return [];
+
+  return withRetry(async () => {
+    const prompt = `
+        For each item, judge whether it's specific and clear enough to automatically create a real ticket for, without human review.
+
+        An item is confident ONLY if BOTH are true:
+        - owner is a specific named person (NOT "unspecified", "someone", "the team", or similar)
+        - the task itself is concrete, not vague
+
+        If the owner is not a specific named person, isConfident MUST be false, regardless of how clear the task sounds.
+
+        Items:
+        ${items.map(item => `[${item.id}] text="${item.text}", owner="${item.owner}", deadline="${item.deadline}"`).join('\n')}
+    `;
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.6-flash',
+      contents: prompt,
+      config: { responseMimeType: 'application/json', responseSchema: batchConfidenceSchema }
+    });
+    return JSON.parse(response.text).judgments;
+  });
+}
+
 async function runCase(testCase) {
   let state = { actionItems: [] };
 
   for (const chunk of testCase.chunks) {
     state = await updateMeetingState(state, chunk);
+    await sleep(10000); // ~6 RPM free tier = 1 request per 10s
   }
 
   const extracted = state.actionItems;
 
-  // --- Score extraction: precision & recall via matching ---
-  const matchedGroundTruth = new Set();
-  const matchedExtracted = new Set();
+  const matches = await matchAllItems(extracted, testCase.groundTruth);
+  await sleep(10000);
 
-  for (const gt of testCase.groundTruth) {
-    for (const item of extracted) {
-      if (matchedExtracted.has(item.id)) continue; // each extracted item can only match once
-      const match = await isSameCommitment(item, gt);
-      if (match) {
-        matchedGroundTruth.add(gt);
-        matchedExtracted.add(item.id);
-        gt._matchedItem = item; // stash for confidence-gating check below
-        break;
-      }
-    }
-  }
+  const truePositives = matches.length;
+  const falseNegatives = testCase.groundTruth.length - truePositives;
+  const falsePositives = extracted.length - matches.length;
 
-  const truePositives = matchedGroundTruth.size;
-  const falseNegatives = testCase.groundTruth.length - truePositives; // ground truth items we missed
-  const falsePositives = extracted.length - matchedExtracted.size;    // extracted items with no matching ground truth (hallucinations)
+  const matchedItems = matches.map(m => extracted.find(item => item.id === m.extractedItemId)).filter(Boolean);
+  const judgments = await judgeAllConfidence(matchedItems);
+  await sleep(10000);
 
-  // --- Score confidence gating, only for correctly-matched items ---
   let gatingCorrect = 0;
-  let gatingTotal = 0;
-
-  for (const gt of testCase.groundTruth) {
-    if (!gt._matchedItem) continue; // can't judge gating on an item we never even extracted
-    gatingTotal++;
-    const judgment = await judgeConfidence(gt._matchedItem);
-    if (judgment.isConfident === gt.shouldAutoTicket) {
+  for (const match of matches) {
+    const gt = testCase.groundTruth[match.groundTruthIndex];
+    const judgment = judgments.find(j => j.itemId === match.extractedItemId);
+    if (judgment && judgment.isConfident === gt.shouldAutoTicket) {
       gatingCorrect++;
     }
   }
 
   return {
     name: testCase.name,
-    truePositives,
-    falseNegatives,
-    falsePositives,
-    gatingCorrect,
-    gatingTotal,
+    truePositives, falseNegatives, falsePositives,
+    gatingCorrect, gatingTotal: matches.length,
     extractedCount: extracted.length,
     groundTruthCount: testCase.groundTruth.length
   };
 }
 
-// ---- Run all cases and aggregate ----
 async function runEval() {
   const results = [];
 
@@ -160,10 +198,7 @@ async function runEval() {
   console.log(`Confidence-gating accuracy: ${(gatingAccuracy * 100).toFixed(1)}%`);
 }
 
-runEval().catch(err => {
-  console.error('Error during evaluation:', err);
-  process.exit(1);
-});
+runEval();
 
 // test('Run evaluation suite', async () => {
 //   await runEval();
